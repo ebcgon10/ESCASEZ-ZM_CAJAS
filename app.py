@@ -1,5 +1,7 @@
+import io
 import os
 from datetime import datetime
+from html import escape
 from zoneinfo import ZoneInfo
 
 import pandas as pd
@@ -8,37 +10,31 @@ import streamlit.components.v1 as components
 
 import motor
 
-st.set_page_config(page_title="Escasez ZM_CAJA | CD Coquimbo", page_icon="🚚", layout="wide")
+st.set_page_config(page_title="Escasez ZM_CAJAS | CD Coquimbo", page_icon="📦", layout="wide")
 BASE = os.path.dirname(os.path.abspath(__file__))
 M = os.path.join(BASE, "maestros")
 
-st.markdown("""<style>
-.block-container {padding-top: 1.5rem;}
-.titulo {font-size: 1.8rem; font-weight: 700; margin-bottom: 0;}
-.sub {color: #888; margin-top: 0;}
-div[data-testid="stMetric"] {background: rgba(59,130,246,0.10); border-radius: 10px;
-                             padding: 10px 14px; border-left: 5px solid #3B82F6;}
+VERDE = "#5BB030"
+VERDE_OSC = "#205C40"
+st.markdown(f"""<style>
+.stApp {{ background-color: #DCEBD9; }}
+h1, h2, h3, .titulo {{ color: {VERDE_OSC} !important; }}
+.titulo {{ font-size: 2.6rem; font-weight: 800; margin: 0.5rem 0 1rem 0; }}
+.subt {{ font-size: 1.6rem; font-weight: 700; color: {VERDE_OSC}; margin-bottom: .3rem; }}
+div[data-testid="stFileUploader"] {{ background: #fff; border-radius: 14px; padding: 12px 18px; }}
+div.stButton > button {{ background-color: {VERDE}; color: #fff; font-weight: 700; font-size: 1.1rem;
+    border: none; border-radius: 8px; padding: .75rem 0; width: 100%; }}
+div.stButton > button:hover {{ background-color: #4E9A28; color: #fff; }}
 </style>""", unsafe_allow_html=True)
-st.markdown('<p class="titulo">🚚 Escasez proyectada ZM_CAJA</p>', unsafe_allow_html=True)
-st.markdown('<p class="sub">CD Coquimbo · Venta completa del fleetloader vs stock en picking de cajas · '
-            'abastecer antes de liberar las rutas</p>', unsafe_allow_html=True)
+
+st.markdown('<div class="titulo">Escasez ZM_CAJAS · Reposición antes de liberar</div>', unsafe_allow_html=True)
 
 
 @st.cache_data
 def maestros():
-    return motor.cargar_maestros(os.path.join(M, "ubicaciones.csv"), os.path.join(M, "preferencia.csv"),
-                                 os.path.join(M, "zonas.csv"))
-
-
-@st.cache_data
-def maestros_excel(datos: bytes, nombre: str):
-    import io
-    return motor.cargar_maestros(*motor.hojas_maestro_excel(io.BytesIO(datos)))
-
-
-@st.cache_data
-def paletizado():
-    return motor.cargar_paletizado(os.path.join(M, "paletizado.csv"))
+    ub, pr, zm = motor.cargar_maestros(os.path.join(M, "ubicaciones.csv"), os.path.join(M, "preferencia.csv"),
+                                       os.path.join(M, "zonas.csv"))
+    return ub, pr, zm, motor.cargar_paletizado(os.path.join(M, "paletizado.csv"))
 
 
 @st.cache_data(ttl=3600)
@@ -46,210 +42,99 @@ def bbdd():
     return motor.cargar_bbdd(os.path.join(M, "bbdd_codigos.csv"))
 
 
-# ------------------------------------------------------------------ barra lateral
-with st.sidebar:
-    st.header("1. Archivos")
-    f_fleet = st.file_uploader("Fleetloader Truck (FLETBxxxx.TXT)", type=["txt", "csv", "xlsx", "xls"],
-                               accept_multiple_files=True,
-                               help="Puedes subir más de uno si la venta del día viene en varias sesiones.")
-    f_vu = st.file_uploader("Operaciones de vida útil (.csv)", type=["csv"])
-    with st.expander("Maestros WMS (opcional)"):
-        f_maestro = st.file_uploader("Excel con hojas UBICACIONES / PREFERENCIA / ZM", type=["xlsx"],
-                                     help="Si lo subes, reemplaza por esta sesión los maestros guardados en el repo.")
-
-if not (f_fleet and f_vu):
-    st.info("⬅️ Sube el **fleetloader** y las **operaciones de vida útil**.")
-    with st.expander("¿Cómo calcula?", expanded=True):
-        st.markdown("""
-1. **Fleetloader → SAP:** cada `SKU` de Truck se convierte a SAP con `bbdd_codigos.csv`
-   (la misma BBDD del Sistema de Revisión Venta). Se suma el mismo SKU repetido en varias bahías.
-2. **Tabla dinámica:** cajas totales por SKU SAP de todas las rutas, y matriz SKU × ruta en orden `LOAD_PRIORITY`.
-3. **Cruce con vida útil:** stock en estado D de la posición **ZM_CAJ** asignada al SKU (preferencias).
-4. **Necesidad = venta − stock picking.**
-   - **Ola 1:** lo que cabe ahora (capacidad − stock). Se repone **antes de liberar**.
-   - **Llenados extra:** cuántas veces más hay que llenar la posición si es más chica que la venta.
-5. **Ruta donde empieza la escasez:** recorriendo las rutas por `LOAD_PRIORITY`, la primera que deja la posición
-   en cero con el stock de hoy, y la primera que lo haría aun llenando la posición al 100 %.
-6. **Quiebre CD:** ALMAC, ALMPIC, MIX-01, REBA-01 y STREC no alcanzan (pedir traslado / revisar CL).
-   Reempaque, subestándar, revisión, consumo y merma no se consideran.
-
-Los SKU que no tienen posición ZM_CAJA (ZM_PICK / ZM_PALLET) quedan fuera: van por trabajo dirigido del WMS.
-""")
-    st.stop()
-
-# ------------------------------------------------------------------ lectura fleetloader
-try:
-    partes = [motor.leer_fleetloader(f) for f in f_fleet]
-    raw = pd.concat([p[0] for p in partes], ignore_index=True)
-    cols = partes[0][1]
-except Exception as e:
-    st.error(f"No se pudo leer el fleetloader: {e}")
-    st.stop()
-
-if not all(cols.get(k) for k in ["camion", "codigo", "cantidad"]):
-    st.warning("No reconocí todas las columnas del fleetloader. Indícalas:")
-    c = list(raw.columns)
-    a, b, d = st.columns(3)
-    cols["camion"] = a.selectbox("Ruta / camión", c)
-    cols["codigo"] = b.selectbox("SKU TRUCK", c)
-    cols["cantidad"] = d.selectbox("Cantidad (cajas)", c)
-
-try:
-    ub, pr, zm = maestros_excel(f_maestro.getvalue(), f_maestro.name) if f_maestro else maestros()
-    origen_maestros = f_maestro.name if f_maestro else "repo (maestros/)"
-except Exception as e:
-    st.error(f"No se pudo leer el Excel de maestros: {e}")
-    st.stop()
-pal = paletizado()
-bb, origen_bbdd = bbdd()
-todas = motor.preparar_fleet(raw, cols, bb, pal)
-lista_rutas = motor.rutas(todas)
-etiqueta = {r.camion: f"{r.orden_camion:02d} · {r.camion}" for r in lista_rutas.itertuples()}
-
-with st.sidebar:
-    st.header("2. Rutas")
-    excluir = st.multiselect("Rutas ya liberadas (excluir)", list(etiqueta), format_func=etiqueta.get,
-                             help="Si ya liberaste algunas rutas y su picking está descontado del stock, sácalas.")
-    st.header("3. Parámetros")
-    descontar = st.checkbox("Descontar pallets completos", value=False,
-                            help="Si una ruta lleva ≥ 1 pallet completo de un SKU, esas cajas salen por trabajo "
-                                 "dirigido y no desde ZM_CAJA. Norma: paletizado WMS; si no está, la del Truck "
-                                 "(QTY_PER_LAYER × LAYERS_PER_PALLET). Apagado = escenario conservador.")
-    holgura = st.number_input("Holgura sobre la venta (%)", 0, 50, 0)
-    bajar = st.checkbox("Bajar restos en altura", value=True,
-                        help="A igual vencimiento se usan primero los restos de 2°/3° nivel, y si el resto cabe "
-                             "entero en el espacio libre de la posición se baja completo para eliminarlo. "
-                             "Nunca se salta el FEFO.")
-    usar_pp = st.checkbox("Usar también la posición ZM_PICK del mismo SKU", value=False,
-                          help="Algunos SKU tienen posición de cajas (ZM_CAJ) y de pallet (ZM_PICK). Con esto, las "
-                               "cajas para ZM_CAJ también pueden salir de su ZM_PICK, siempre respetando FEFO.")
-    st.caption("Origen: ALMAC · ALMPIC · MIX-01 · REBA-01 · STREC · estado D · sin vencidos · **FEFO 100 %**. "
-               "No se usan reempaque, subestándar, revisión, consumo ni merma.")
-
-# ------------------------------------------------------------------ cálculo
-try:
-    fleet = motor.preparar_fleet(raw, cols, bb, pal, descontar_pallets=descontar, excluir_rutas=excluir)
-    vu = motor.cargar_vida_util(f_vu)
-    fecha_ref = datetime.now(ZoneInfo("America/Santiago")).date()
-    resumen, movs, sin_zm, sin_map, alertas = motor.calcular(
-        fleet, vu, ub, pr, zm, pal, fecha_ref=fecha_ref, holgura_pct=float(holgura), bajar_restos=bajar,
-        usar_zm_pick=usar_pp)
-    fefo_mal = motor.verificar_fefo(movs, vu, fecha_ref)
-    dinamica = motor.tabla_dinamica(fleet)
-    adc = motor.propuesta_adc(alertas, ub, pr)
-except Exception as e:
-    st.error(f"No se pudo procesar: {e}")
-    st.stop()
-
-n = lambda x: f"{int(x):,}".replace(",", ".")  # noqa: E731
-rep = resumen[resumen["necesidad"] > 0]
-fecha_sesion = ", ".join(sorted(raw[cols["fecha"]].dropna().unique())) if cols.get("fecha") else "—"
-k = st.columns(6)
-k[0].metric("Rutas", n(fleet["camion"].nunique()))
-k[1].metric("Cajas fleetloader", n(fleet["cajas_pedido"].sum()))
-k[2].metric("Cajas desde ZM_CAJA", n(resumen["venta_cajas"].sum()))
-k[3].metric("SKU a reponer", n(len(rep)))
-k[4].metric("Cajas a reponer", n(rep["necesidad"].sum()), help=f"Ola 1 (cabe ahora): {n(rep['reponer_ola1'].sum())} cj · el resto va en reposiciones intermedias")
-k[5].metric("SKU quiebre CD", n((resumen["faltante_cd"] > 0).sum()))
-if not movs.empty:
-    ef = movs["efecto"].value_counts()
-    eliminados = int(ef.get("Elimina resto en altura", 0) + ef.get("Baja resto en altura (espacio libre)", 0))
-    r1, r2, r3, r4 = st.columns(4)
-    r1.metric("FEFO", "100 % ✅" if fefo_mal.empty else f"{len(fefo_mal)} LPN fuera ❌")
-    r2.metric("Restos en altura eliminados", n(eliminados))
-    r3.metric("Restos en altura reducidos", n(ef.get("Reduce resto en altura", 0)))
-    r4.metric("Pallets abiertos en altura", n(ef.get("Abre pallet en altura", 0)),
-              help="Solo ocurre cuando FEFO obliga (el lote más antiguo es un pallet completo en altura).")
-    if not fefo_mal.empty:
-        st.error("Hay LPN más antiguos sin consumir: revisar pestaña Alertas / reporte.")
-st.caption(f"Sesión Truck: {fecha_sesion} · BBDD códigos: {origen_bbdd} · Maestros: {origen_maestros} · Fecha de referencia {fecha_ref:%d-%m-%Y}")
-if len(sin_map):
-    st.warning(f"⚠️ {len(sin_map)} SKU TRUCK sin mapeo a SAP ({n(sin_map['cajas'].sum())} cj). "
-               "Agrégalos a bbdd_codigos.csv (pestaña *Sin mapeo / sin ZM_CAJA*).")
-
-
-def pintar(row):
-    return [f"background-color: {motor.ESTADOS.get(row['estado'], 'white')}; color: #111"] * len(row)
-
-
-t1, t2, t3, t4, t5, t6, t7 = st.tabs(["📋 Resumen por SKU", "🖨️ Hoja operarios", "🔁 Movimientos",
-                                      "📊 Tabla dinámica / rutas", "❓ Sin mapeo / sin ZM_CAJA", "⚠️ Alertas",
-                                      "📝 ADC maestro WMS"])
-with t1:
-    est = st.multiselect("Estado", list(motor.ESTADOS), default=list(motor.ESTADOS)[:3])
-    vista = resumen[resumen["estado"].isin(est)] if est else resumen
-    st.dataframe(vista.style.apply(pintar, axis=1), use_container_width=True, height=560, hide_index=True,
-                 column_config={"venta_cajas": "Venta (cj)", "stock_picking": "Stock picking",
-                                "reponer_ola1": "Ola 1 (cabe ahora)", "reponer_intermedio": "Reposición intermedia",
-                                "llenados_extra": "Llenados extra", "faltante_cd": "Faltante CD",
-                                "ruta_escasez_hoy": "Escasez desde ruta (hoy)",
-                                "ruta_escasez_lleno": "Escasez desde ruta (posición llena)"})
-
-with t2:
-    if movs.empty:
-        st.success("No hay cajas que reponer: el stock de picking cubre la venta. 🎉")
-    else:
-        a, b = st.columns([1, 2])
-        esc = movs[movs["tipo_tarea"] == "Escasez"]
-        olas = a.multiselect("Ola", sorted(esc["ola"].unique()), default=[1] if (esc["ola"] == 1).any() else [],
-                             help="Ola 1 = llenar ahora. Olas 2+ = reposiciones durante el picking.")
-        con_restos = a.checkbox("Incluir bajada de restos en altura (R)", value=True,
-                                help="Tareas extra: restos de 2°/3° nivel que caben enteros en la posición y son "
-                                     "el lote FEFO siguiente. No son necesarios para la venta, liberan altura.")
-        pas = b.multiselect("Pasillo destino", sorted(movs["pasillo_destino"].unique()), placeholder="Todos")
-        sel = esc[esc["ola"].isin(olas)] if olas else esc
-        if con_restos:
-            sel = pd.concat([sel, movs[movs["tipo_tarea"] == "Baja resto"]])
-        sel = sel[sel["pasillo_destino"].isin(pas)] if pas else sel
-        hoja = motor.hoja_operarios(sel)
-        if hoja.empty:
-            st.info("Sin tareas con esos filtros.")
-        else:
-            fh = datetime.now(ZoneInfo("America/Santiago")).strftime("%d-%m-%Y %H:%M")
-            filtros = f"Ola: {', '.join(map(str, olas)) or 'Todas'} | Pasillos: {', '.join(pas) or 'Todos'}"
-            html = motor.html_hoja_ruta(hoja, fh, filtros)
-            components.html(f"""{html}<div class="no-print" style="text-align:center;margin-top:12px">
-              <button onclick="window.print()" style="background:#2563EB;color:#fff;font-weight:bold;padding:12px 24px;
-              font-size:16px;border:none;border-radius:6px;cursor:pointer">🖨️ Imprimir</button></div>""",
-                            height=800, scrolling=True)
-            c1, c2 = st.columns(2)
-            c1.download_button("⬇️ Hoja operarios (HTML)", f"<html><head><meta charset='utf-8'></head><body>{html}</body></html>",
-                               file_name="hoja_escasez_zm_caja.html", mime="text/html", use_container_width=True)
-            c2.download_button("⬇️ Hoja operarios (Excel)", motor.a_excel_hoja(hoja, f"Reabasto ZM_CAJA · {fh} · {filtros}"),
-                               file_name="hoja_escasez_zm_caja.xlsx", use_container_width=True,
-                               mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-with t3:
-    st.dataframe(movs, use_container_width=True, height=560, hide_index=True)
-with t4:
-    st.markdown("**Venta completa por SKU (TRUCK → SAP)**")
-    st.dataframe(dinamica, use_container_width=True, height=320, hide_index=True)
-    st.markdown("**Cajas desde ZM_CAJA por ruta (orden LOAD_PRIORITY)** — solo SKU con posición ZM_CAJA")
-    st.dataframe(motor.matriz_camiones(fleet, solo=resumen["sku_sap"]), use_container_width=True, height=360,
-                 hide_index=True)
-with t5:
-    st.markdown("**SKU TRUCK sin mapeo a SAP**")
-    st.dataframe(sin_map, use_container_width=True, hide_index=True)
-    st.markdown("**SKU sin posición ZM_CAJA** (pallet / trabajo dirigido u otra zona)")
-    st.dataframe(sin_zm, use_container_width=True, hide_index=True)
-with t6:
-    st.dataframe(alertas, use_container_width=True, height=500, hide_index=True)
-with t7:
-    st.caption("Control de cambios sugerido para el maestro WMS (capacidades, preferencias). "
-               "Cada línea se valida antes de cargarla en el WMS.")
-    st.dataframe(adc, use_container_width=True, height=500, hide_index=True)
+c1, c2 = st.columns(2)
+with c1:
+    st.markdown('<div class="subt">1. Fleetloader (venta por camión)</div>', unsafe_allow_html=True)
+    f_fleet = st.file_uploader("Archivo fleetloader", type=["txt", "csv", "xlsx"], key="fleet")
+with c2:
+    st.markdown('<div class="subt">2. Operaciones de Vida Útil</div>', unsafe_allow_html=True)
+    f_vu = st.file_uploader("Archivo de inventario", type=["csv"], key="vu")
 
 st.divider()
-params = {"Fecha de referencia": fecha_ref.strftime("%d-%m-%Y"), "Sesión Truck": fecha_sesion,
-          "Fleetloader": ", ".join(f.name for f in f_fleet), "Vida útil": f_vu.name, "BBDD códigos": origen_bbdd, "Maestros WMS": origen_maestros,
-          "Rutas excluidas": ", ".join(excluir) or "Ninguna",
-          "Descontar pallets completos": "Sí" if descontar else "No", "Holgura (%)": holgura,
-          "FEFO": "100 % (sin tolerancia)", "Bajar restos en altura": "Sí" if bajar else "No",
-          "Origen incluye ZM_PICK propia": "Sí" if usar_pp else "No"}
-st.download_button("📊 Reporte completo (Excel)", type="primary", use_container_width=True,
-                   data=motor.a_excel({"Resumen SKU": resumen, "Movimientos": movs, "Venta por SKU": dinamica,
-                                       "Venta ZM_CAJA por ruta": motor.matriz_camiones(fleet, solo=resumen["sku_sap"]),
-                                       "Detalle fleetloader": fleet, "Sin mapeo": sin_map, "Sin ZM_CAJA": sin_zm,
-                                       "Alertas": alertas, "Control FEFO": fefo_mal,
-                                       "ADC maestro WMS": adc}, params),
-                   file_name=f"escasez_zm_caja_{fecha_ref:%Y%m%d}.xlsx",
-                   mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+if st.button("🚀 Procesar Reposición ZM_CAJAS"):
+    if not (f_fleet and f_vu):
+        st.error("Sube los 2 archivos: fleetloader y operaciones de vida útil.")
+    else:
+        try:
+            ub, pr, zm, pal = maestros()
+            bb, _ = bbdd()
+            raw, cols = motor.leer_fleetloader(f_fleet)
+            if not all(cols.get(k) for k in ["camion", "codigo", "cantidad"]):
+                raise ValueError("el fleetloader no trae las columnas ROUTE_ID / SKU / QUANTITY")
+            fleet = motor.preparar_fleet(raw, cols, bb, pal)
+            vu = motor.cargar_vida_util(f_vu)
+            hoy = datetime.now(ZoneInfo("America/Santiago")).date()
+            resumen, movs, *_ = motor.calcular(fleet, vu, ub, pr, zm, pal, fecha_ref=hoy, bajar_restos=False)
+            st.session_state["hoja"] = motor.hoja_reposicion(resumen, movs)
+            st.session_state["emision"] = datetime.now(ZoneInfo("America/Santiago")).strftime("%d/%m/%Y %H:%M")
+        except Exception as e:
+            st.session_state.pop("hoja", None)
+            st.error(f"No se pudo procesar: {e}")
+
+if "hoja" in st.session_state:
+    hoja = st.session_state["hoja"]
+    emision = st.session_state["emision"]
+    if hoja.empty:
+        st.success("No hay nada que reponer: el stock en las posiciones ZM_CAJA cubre toda la venta. 🎉")
+        st.stop()
+
+    n_sku, n_filas, n_cajas = hoja["SKU"].nunique(), len(hoja), int(hoja["Cantidad"].sum())
+    st.success(f"Procesamiento exitoso: {n_sku} SKUs, {n_filas} filas.")
+
+    filas = ""
+    pasillo_ant = None
+    for i, (pas, sku, desc, org, dst, cant) in enumerate(hoja.itertuples(index=False, name=None), start=1):
+        if pas != pasillo_ant:
+            filas += f'<tr class="pas"><td colspan="7">PASILLO {escape(str(pas))}</td></tr>'
+            pasillo_ant = pas
+        sin = org == "SIN STOCK"
+        filas += f"""<tr{' class="sin"' if sin else ''}><td class="c">{i}</td><td class="sku">{escape(str(sku))}</td>
+          <td>{escape(str(desc))}</td><td class="c org">{escape(str(org))}</td>
+          <td class="c dst">{escape(str(dst))}</td><td class="c qty">{cant}</td><td class="chk"></td></tr>"""
+
+    html = f"""<style>
+      body {{ font-family: Arial, sans-serif; margin: 0; }}
+      .card {{ border: 3px solid #1E293B; border-radius: 10px; padding: 20px 26px; background: #fff; color: #0F172A; }}
+      .top {{ display: flex; justify-content: space-between; align-items: baseline; }}
+      .t {{ font-size: 30px; font-weight: bold; text-transform: uppercase; }}
+      .em {{ font-size: 15px; }} .tot {{ font-size: 21px; margin: 6px 0 10px 0; }}
+      table {{ width: 100%; border-collapse: collapse; }}
+      th {{ background: #1E293B; color: #fff; padding: 9px 6px; font-size: 14px; text-transform: uppercase; }}
+      td {{ border: 1px solid #94A3B8; padding: 9px 6px; font-size: 16px; }}
+      .c {{ text-align: center; }} .sku {{ font-family: monospace; font-weight: bold; font-size: 15px; }}
+      .org {{ color: #1E3A8A; font-weight: bold; }} .dst {{ color: #065F46; font-weight: bold; }}
+      .qty {{ font-size: 20px; font-weight: bold; }} .chk {{ width: 90px; }}
+      tr.pas td {{ background: #E2E8F0; font-weight: bold; font-size: 14px; letter-spacing: 1px; }}
+      tr.sin td {{ background: #FDE2E2; }} tr.sin .org {{ color: #A6093D; }}
+      .btn {{ background: {VERDE}; color: #fff; font-weight: bold; padding: 12px 26px; font-size: 16px;
+              border: none; border-radius: 8px; cursor: pointer; margin-top: 14px; }}
+      @media print {{ .no-print {{ display: none !important; }} .card {{ border: none; padding: 0; }}
+        tr {{ page-break-inside: avoid; }} thead {{ display: table-header-group; }}
+        @page {{ size: A4 landscape; margin: 10mm; }} }}
+    </style>
+    <div class="card">
+      <div class="top"><div class="t">Reposición ZM_CAJAS / Hoja de ruta</div>
+        <div class="em"><b>Fecha emisión:</b> {emision} hrs</div></div>
+      <div class="tot"><b>Total SKUs:</b> {n_sku} &nbsp;|&nbsp; <b>Total filas:</b> {n_filas}
+        &nbsp;|&nbsp; <b>Total cajas:</b> {n_cajas}</div>
+      <table><thead><tr><th>#</th><th>SKU</th><th>Descripción producto</th><th>Origen (almacenamiento)</th>
+        <th>Destino (surtido)</th><th>Cantidad</th><th>Check ✓</th></tr></thead><tbody>{filas}</tbody></table>
+    </div>
+    <div class="no-print" style="text-align:center"><button class="btn" onclick="window.print()">🖨️ Imprimir hoja</button></div>"""
+    components.html(html, height=min(260 + 46 * (n_filas + hoja["Pasillo"].nunique()), 4000), scrolling=True)
+
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="xlsxwriter") as xw:
+        out = hoja.drop(columns="Pasillo").assign(Check="")
+        out.to_excel(xw, sheet_name="Reposición", index=False, startrow=2)
+        ws, wb = xw.sheets["Reposición"], xw.book
+        ws.write(0, 0, f"REPOSICIÓN ZM_CAJAS · {emision} · {n_sku} SKUs · {n_cajas} cajas",
+                 wb.add_format({"bold": True, "font_size": 13}))
+        head = wb.add_format({"bold": True, "bg_color": "#1E293B", "font_color": "white", "border": 1})
+        for j, (c, w) in enumerate(zip(out.columns, [14, 42, 22, 18, 10, 10])):
+            ws.write(2, j, c, head)
+            ws.set_column(j, j, w)
+        ws.set_landscape(); ws.set_paper(9); ws.fit_to_pages(1, 0); ws.repeat_rows(2)
+    st.download_button("⬇️ Descargar Excel", buf.getvalue(), file_name="reposicion_zm_cajas.xlsx",
+                       mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                       use_container_width=True)

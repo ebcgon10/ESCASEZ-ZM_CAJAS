@@ -4,6 +4,15 @@ App Streamlit que, **antes de liberar las rutas**, cruza toda la venta del fleet
 contra el stock de las posiciones de picking **ZM_CAJ** del WMS. Así se repone de una vez lo que
 va a faltar en vez de ir eliminando la escasez ruta por ruta.
 
+## Uso
+1. Sube el **fleetloader** (`FLETBxxxx.TXT`) y las **operaciones de vida útil** (`.csv`).
+2. Presiona **Procesar**.
+3. Sale una sola hoja, ordenada por pasillo: **SKU · Descripción · Origen (almacenamiento) · Destino (surtido) ·
+   Cantidad · Check**. Se imprime o se descarga en Excel.
+
+**Cantidad** = venta del fleetloader − stock en la posición ZM_CAJA: lo que hay que reponer para cumplir todo lo
+pedido. Si se toma de varios LPN, sale una fila por origen. Origen `SIN STOCK` = no hay en almacenamiento.
+
 ## Archivos que se suben
 | Archivo | Origen | Uso |
 |---|---|---|
@@ -49,11 +58,6 @@ otro artículo, ubicaciones con 2 artículos) para validarlo antes de cargarlo e
 
 Los SKU sin posición ZM_CAJA (ZM_PICK / ZM_PALLET) quedan fuera: van por trabajo dirigido del WMS.
 
-## Opciones
-- **Rutas ya liberadas (excluir)**: para recalcular a mitad de jornada.
-- **Descontar pallets completos**: las cajas que salen como pallet completo no se cuentan contra ZM_CAJA.
-- **Holgura (%)** sobre la venta.
-- **Bajar restos en altura** y **usar la ZM_PICK del mismo SKU** como origen.
 
 ## Ejecutar
 ```

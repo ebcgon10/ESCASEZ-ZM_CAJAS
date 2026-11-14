@@ -589,6 +589,33 @@ def propuesta_adc(alertas, ubic, pref):
     return adc
 
 
+def hoja_reposicion(resumen, movs):
+    """Hoja única para bodega: SKU · Descripción · Origen · Destino · Cantidad, ordenada por pasillo.
+    Cantidad = venta - stock en la posición (lo necesario para cumplir todo lo pedido), repartida
+    por LPN de origen según FEFO. Si no hay stock en almacenamiento, el origen queda 'SIN STOCK'."""
+    filas = []
+    if movs is not None and not movs.empty:
+        m = movs[movs["tipo_tarea"] == "Escasez"]
+        g = (m.groupby(["articulo", "descripcion", "ubicacion_origen", "ubicacion_destino"], as_index=False, sort=False)
+             .agg(cantidad=("cajas_a_mover", "sum"), caducidad=("caducidad", "min")))
+        filas.append(g)
+    if resumen is not None and not resumen.empty:
+        q = resumen[resumen["faltante_cd"] > 0]
+        filas.append(pd.DataFrame({"articulo": q["sku_sap"], "descripcion": q["descripcion"],
+                                   "ubicacion_origen": "SIN STOCK", "ubicacion_destino": q["ubicacion_zm_caja"],
+                                   "cantidad": q["faltante_cd"], "caducidad": pd.NaT}))
+    if not filas:
+        return pd.DataFrame(columns=["Pasillo", "SKU", "Descripción", "Origen", "Destino", "Cantidad"])
+    h = pd.concat(filas, ignore_index=True)
+    h = h[h["cantidad"] > 0]
+    h["pasillo"] = h["ubicacion_destino"].map(pasillo_de)
+    h["sin_stock"] = (h["ubicacion_origen"] == "SIN STOCK").astype(int)
+    h = h.sort_values(["pasillo", "ubicacion_destino", "sin_stock", "caducidad"])
+    return pd.DataFrame({"Pasillo": h["pasillo"].values, "SKU": h["articulo"].values,
+                         "Descripción": h["descripcion"].values, "Origen": h["ubicacion_origen"].values,
+                         "Destino": h["ubicacion_destino"].values, "Cantidad": h["cantidad"].astype(int).values})
+
+
 # ================================================================== salidas
 def hoja_operarios(movs):
     if movs is None or movs.empty:
