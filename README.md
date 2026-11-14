@@ -30,14 +30,23 @@ Cuando cambien preferencias, capacidades o zonas en el WMS, reemplaza el CSV res
    - **Llenados extra** = reposiciones durante el picking cuando la posición es más chica que la venta.
 4. **Escasez desde ruta**: primera ruta, por `LOAD_PRIORITY`, que deja la posición en cero (con stock de hoy y con la posición llena).
 5. **Quiebre CD**: ALMAC/ALMPIC no alcanza para cubrir la necesidad.
-6. Movimientos desde ALMAC/ALMPIC: estado D, sin vencidos, FEFO y restos de pallet primero.
+6. Movimientos: estado D, sin vencidos, **FEFO 100 %** (sin tolerancia). Origen ALMAC/ALMPIC y, si el SKU
+   también tiene posición ZM_PICK, esa posición.
+   - A igual vencimiento: **restos en 2°/3° nivel** (menos cajas primero) → restos en piso →
+     pallets completos en piso → pallets completos en altura.
+   - Si el resto en altura cabe entero en el espacio libre de la posición, se baja completo.
+   - **Bajada de restos (R):** aunque el SKU ya esté cubierto, si el siguiente lote FEFO es un resto en altura
+     que cabe entero en la posición, se propone bajarlo para liberar el nivel.
+   - Control FEFO automático: la app verifica que ningún LPN más antiguo quede sin consumir.
+   - Alerta cuando la posición de picking tiene un lote más nuevo que el almacenamiento.
 
 Los SKU sin posición ZM_CAJA (ZM_PICK / ZM_PALLET) quedan fuera: van por trabajo dirigido del WMS.
 
 ## Opciones
 - **Rutas ya liberadas (excluir)**: para recalcular a mitad de jornada.
 - **Descontar pallets completos**: las cajas que salen como pallet completo no se cuentan contra ZM_CAJA.
-- **Holgura (%)** sobre la venta y **tolerancia FEFO (días)**.
+- **Holgura (%)** sobre la venta.
+- **Bajar restos en altura** y **usar la ZM_PICK del mismo SKU** como origen.
 
 ## Ejecutar
 ```

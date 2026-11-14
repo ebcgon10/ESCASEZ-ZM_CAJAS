@@ -101,8 +101,14 @@ with st.sidebar:
                                  "dirigido y no desde ZM_CAJA. Norma: paletizado WMS; si no está, la del Truck "
                                  "(QTY_PER_LAYER × LAYERS_PER_PALLET). Apagado = escenario conservador.")
     holgura = st.number_input("Holgura sobre la venta (%)", 0, 50, 0)
-    tol = st.number_input("Tolerancia FEFO (días)", 0, 60, 0)
-    st.caption("Origen ALMAC / ALMPIC · estado D · sin vencidos · FEFO y restos primero.")
+    bajar = st.checkbox("Bajar restos en altura", value=True,
+                        help="A igual vencimiento se usan primero los restos de 2°/3° nivel, y si el resto cabe "
+                             "entero en el espacio libre de la posición se baja completo para eliminarlo. "
+                             "Nunca se salta el FEFO.")
+    usar_pp = st.checkbox("Usar también la posición ZM_PICK del mismo SKU", value=True,
+                          help="Algunos SKU tienen posición de cajas (ZM_CAJ) y de pallet (ZM_PICK). Con esto, las "
+                               "cajas para ZM_CAJ también pueden salir de su ZM_PICK, siempre respetando FEFO.")
+    st.caption("Origen ALMAC / ALMPIC · estado D · sin vencidos · **FEFO 100 %**.")
 
 # ------------------------------------------------------------------ cálculo
 try:
@@ -110,7 +116,9 @@ try:
     vu = motor.cargar_vida_util(f_vu)
     fecha_ref = datetime.now(ZoneInfo("America/Santiago")).date()
     resumen, movs, sin_zm, sin_map, alertas = motor.calcular(
-        fleet, vu, ub, pr, zm, pal, fecha_ref=fecha_ref, tolerancia_dias=int(tol), holgura_pct=float(holgura))
+        fleet, vu, ub, pr, zm, pal, fecha_ref=fecha_ref, holgura_pct=float(holgura), bajar_restos=bajar,
+        usar_zm_pick=usar_pp)
+    fefo_mal = motor.verificar_fefo(movs, vu, fecha_ref)
     dinamica = motor.tabla_dinamica(fleet)
 except Exception as e:
     st.error(f"No se pudo procesar: {e}")
@@ -124,8 +132,19 @@ k[0].metric("Rutas", n(fleet["camion"].nunique()))
 k[1].metric("Cajas fleetloader", n(fleet["cajas_pedido"].sum()))
 k[2].metric("Cajas desde ZM_CAJA", n(resumen["venta_cajas"].sum()))
 k[3].metric("SKU a reponer", n(len(rep)))
-k[4].metric("Cajas a reponer", n(rep["necesidad"].sum()), help=f"Ola 1 (cabe ahora): {n(rep['reponer_ola1'].sum())} cj")
+k[4].metric("Cajas a reponer", n(rep["necesidad"].sum()), help=f"Ola 1 (cabe ahora): {n(rep['reponer_ola1'].sum())} cj · el resto va en reposiciones intermedias")
 k[5].metric("SKU quiebre CD", n((resumen["faltante_cd"] > 0).sum()))
+if not movs.empty:
+    ef = movs["efecto"].value_counts()
+    eliminados = int(ef.get("Elimina resto en altura", 0) + ef.get("Baja resto en altura (espacio libre)", 0))
+    r1, r2, r3, r4 = st.columns(4)
+    r1.metric("FEFO", "100 % ✅" if fefo_mal.empty else f"{len(fefo_mal)} LPN fuera ❌")
+    r2.metric("Restos en altura eliminados", n(eliminados))
+    r3.metric("Restos en altura reducidos", n(ef.get("Reduce resto en altura", 0)))
+    r4.metric("Pallets abiertos en altura", n(ef.get("Abre pallet en altura", 0)),
+              help="Solo ocurre cuando FEFO obliga (el lote más antiguo es un pallet completo en altura).")
+    if not fefo_mal.empty:
+        st.error("Hay LPN más antiguos sin consumir: revisar pestaña Alertas / reporte.")
 st.caption(f"Sesión Truck: {fecha_sesion} · BBDD códigos: {origen_bbdd} · Fecha de referencia {fecha_ref:%d-%m-%Y}")
 if len(sin_map):
     st.warning(f"⚠️ {len(sin_map)} SKU TRUCK sin mapeo a SAP ({n(sin_map['cajas'].sum())} cj). "
@@ -153,10 +172,16 @@ with t2:
         st.success("No hay cajas que reponer: el stock de picking cubre la venta. 🎉")
     else:
         a, b = st.columns([1, 2])
-        olas = a.multiselect("Ola", sorted(movs["ola"].unique()), default=[1],
+        esc = movs[movs["tipo_tarea"] == "Escasez"]
+        olas = a.multiselect("Ola", sorted(esc["ola"].unique()), default=[1] if (esc["ola"] == 1).any() else [],
                              help="Ola 1 = llenar ahora. Olas 2+ = reposiciones durante el picking.")
+        con_restos = a.checkbox("Incluir bajada de restos en altura (R)", value=True,
+                                help="Tareas extra: restos de 2°/3° nivel que caben enteros en la posición y son "
+                                     "el lote FEFO siguiente. No son necesarios para la venta, liberan altura.")
         pas = b.multiselect("Pasillo destino", sorted(movs["pasillo_destino"].unique()), placeholder="Todos")
-        sel = movs[movs["ola"].isin(olas)] if olas else movs
+        sel = esc[esc["ola"].isin(olas)] if olas else esc
+        if con_restos:
+            sel = pd.concat([sel, movs[movs["tipo_tarea"] == "Baja resto"]])
         sel = sel[sel["pasillo_destino"].isin(pas)] if pas else sel
         hoja = motor.hoja_operarios(sel)
         if hoja.empty:
@@ -196,11 +221,12 @@ params = {"Fecha de referencia": fecha_ref.strftime("%d-%m-%Y"), "Sesión Truck"
           "Fleetloader": ", ".join(f.name for f in f_fleet), "Vida útil": f_vu.name, "BBDD códigos": origen_bbdd,
           "Rutas excluidas": ", ".join(excluir) or "Ninguna",
           "Descontar pallets completos": "Sí" if descontar else "No", "Holgura (%)": holgura,
-          "Tolerancia FEFO (días)": int(tol)}
+          "FEFO": "100 % (sin tolerancia)", "Bajar restos en altura": "Sí" if bajar else "No",
+          "Origen incluye ZM_PICK propia": "Sí" if usar_pp else "No"}
 st.download_button("📊 Reporte completo (Excel)", type="primary", use_container_width=True,
                    data=motor.a_excel({"Resumen SKU": resumen, "Movimientos": movs, "Venta por SKU": dinamica,
                                        "Venta ZM_CAJA por ruta": motor.matriz_camiones(fleet, solo=resumen["sku_sap"]),
                                        "Detalle fleetloader": fleet, "Sin mapeo": sin_map, "Sin ZM_CAJA": sin_zm,
-                                       "Alertas": alertas}, params),
+                                       "Alertas": alertas, "Control FEFO": fefo_mal}, params),
                    file_name=f"escasez_zm_caja_{fecha_ref:%Y%m%d}.xlsx",
                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")

@@ -13,7 +13,10 @@ Flujo
 5. Necesidad = venta - stock picking, repartida en olas:
      ola 1   = lo que cabe ahora (capacidad - stock), se hace ANTES de liberar;
      ola 2.. = reposiciones intermedias cuando la posición es más chica que la venta.
-6. Origen: LPN en ALMAC / ALMPIC, estado D, no vencidos, FEFO y restos primero.
+6. Origen: LPN en ALMAC / ALMPIC (y la posición ZM_PICK del mismo SKU, si tiene), estado D, no vencidos. FEFO 100 % (sin tolerancia).
+   A igual vencimiento: restos en 2°/3° nivel primero (menos cajas primero), luego restos en piso,
+   luego pallets completos en piso y al final pallets completos en altura.
+   Si un resto en altura cabe entero en el espacio libre de la posición, se baja completo.
 7. Primera ruta que caería en escasez (con el stock de hoy y con la posición llena).
 
 ZM_PICK / ZM_PALLET no se calculan aquí: van por trabajo dirigido del WMS.
@@ -275,7 +278,8 @@ ESTADOS = {"Quiebre CD (no alcanza almacenamiento)": "#F4CCCC",
            "Cubierto con stock picking": "#D9EAD3"}
 
 
-def calcular(fleet, vu, ubic, pref, zonas, paletizado=None, fecha_ref=None, tolerancia_dias=0, holgura_pct=0.0):
+def calcular(fleet, vu, ubic, pref, zonas, paletizado=None, fecha_ref=None, holgura_pct=0.0,
+             bajar_restos=True, usar_zm_pick=True):
     fecha_ref = pd.Timestamp(fecha_ref or pd.Timestamp.today().normalize())
     alertas = []
 
@@ -304,7 +308,14 @@ def calcular(fleet, vu, ubic, pref, zonas, paletizado=None, fecha_ref=None, tole
         alertas.append({"tipo": "Posición ZM_CAJA con otro artículo", "ubicacion": r["Ubicacion"],
                         "articulo": r["articulo"], "detalle": f"Encontrado {r['Articulo']} ({int(r['Cantidad'])} cj)"})
 
-    origen = disp[disp["Area"].isin(AREAS_ORIGEN)].copy()
+    # posiciones ZM_PICK / ZM_PALLET (pallet en piso) asignadas al MISMO artículo: también sirven de origen
+    pick_pal = zonas[zonas["zona_movimiento"].isin(["ZM_PICK", "ZM_PALLET"])][["ubicacion"]]
+    pick_pal = pick_pal.merge(pref[["ubicacion", "articulo"]], on="ubicacion")
+    llave_pp = set(zip(pick_pal["ubicacion"], pick_pal["articulo"]))
+    es_pp = pd.Series([(u, a) in llave_pp for u, a in zip(disp["Ubicacion"], disp["Articulo"])], index=disp.index)
+    origen = disp[disp["Area"].isin(AREAS_ORIGEN) | (es_pp & usar_zm_pick)].copy()
+    origen.loc[~origen["Area"].isin(AREAS_ORIGEN), "Area"] = "ZM_PICK propia"
+    st_pp = disp[es_pp].groupby("Articulo")["Cantidad"].sum()
     vencidos = origen[origen["dias_vida"] <= 0]
     origen = origen[(origen["dias_vida"] > 0) & origen["Fecha de caducidad"].notna()]
     st_alm = origen.groupby("Articulo")["Cantidad"].sum()
@@ -314,6 +325,22 @@ def calcular(fleet, vu, ubic, pref, zonas, paletizado=None, fecha_ref=None, tole
     t = t[t["ubicacion"].notna()].merge(st_pick, on=["ubicacion", "articulo"], how="left")
     t["stock_picking"] = t["stock_picking"].fillna(0)
     t["stock_almacenamiento"] = t["articulo"].map(st_alm).fillna(0)
+    t["stock_zm_pick"] = t["articulo"].map(st_pp).fillna(0)
+
+    # si el maestro dice menos capacidad que lo que hoy hay físicamente, se usa el stock como capacidad
+    sobre = t[t["stock_picking"] > t["capacidad"]]
+    for _, r in sobre.iterrows():
+        alertas.append({"tipo": "Capacidad del maestro menor al stock actual (se usa el stock)",
+                        "ubicacion": r["ubicacion"], "articulo": r["articulo"],
+                        "detalle": f"Maestro {int(r['capacidad'])} cj · stock {int(r['stock_picking'])} cj → revisar vía ADC"})
+    t["capacidad"] = t[["capacidad", "stock_picking"]].max(axis=1)
+
+    # stock del SKU en otras áreas (patio, reempaque, etc.) para saber dónde buscar si no alcanza
+    otras = vu[~vu["Area"].isin(AREAS_ORIGEN) & ~vu["Ubicacion"].isin(pos["ubicacion"])
+               & ~vu["Ubicacion"].isin(pick_pal["ubicacion"])]
+    otras = (otras.groupby(["Articulo", "Area", "Estado de inventario"])["Cantidad"].sum().reset_index())
+    otras["txt"] = otras["Area"] + "/" + otras["Estado de inventario"] + ": " + otras["Cantidad"].astype(int).astype(str)
+    t["stock_otras_areas"] = t["articulo"].map(otras.groupby("Articulo")["txt"].agg(" · ".join)).fillna("")
 
     t["venta_objetivo"] = (t["venta_cajas"] * (1 + holgura_pct / 100)).apply(math.ceil)
     t["necesidad"] = (t["venta_objetivo"] - t["stock_picking"]).clip(lower=0)
@@ -358,7 +385,7 @@ def calcular(fleet, vu, ubic, pref, zonas, paletizado=None, fecha_ref=None, tole
 
     resumen = t[["secuencia", "pasillo", "ubicacion", "zona_trabajo", "articulo", "descripcion", "rutas",
                  "venta_cajas", "capacidad", "stock_picking", "necesidad", "reponer_ola1", "reponer_intermedio",
-                 "llenados_extra", "stock_almacenamiento", "faltante_cd", "ruta_escasez_hoy",
+                 "llenados_extra", "stock_almacenamiento", "stock_zm_pick", "faltante_cd", "stock_otras_areas", "ruta_escasez_hoy",
                  "ruta_escasez_lleno", "estado"]].rename(columns={"ubicacion": "ubicacion_zm_caja",
                                                                   "articulo": "sku_sap"})
     orden = {e: i for i, e in enumerate(ESTADOS)}
@@ -368,23 +395,41 @@ def calcular(fleet, vu, ubic, pref, zonas, paletizado=None, fecha_ref=None, tole
               "stock_almacenamiento", "faltante_cd"]:
         resumen[c] = resumen[c].astype(int)
 
-    # movimientos FEFO + restos primero, etiquetados por ola
+    # ---------- movimientos: FEFO 100 % y, a igual vencimiento, bajar restos en altura
     norma = (paletizado.set_index("articulo")["cajas_por_pallet"]
              if paletizado is not None and not paletizado.empty else pd.Series(dtype=float))
     origen["norma"] = origen["Articulo"].map(norma).fillna(origen["Articulo"].map(disp.groupby("Articulo")["Cantidad"].max()))
     origen["es_pallet"] = (origen["Cantidad"] >= origen["norma"]).astype(int)
     origen["nivel"] = origen["Ubicacion"].map(nivel_de)
+    origen["en_altura"] = pd.to_numeric(origen["nivel"], errors="coerce").fillna(1) >= 2
+    # prioridad dentro del MISMO vencimiento:
+    # 0 resto en altura · 1 resto en piso · 2 pallet completo en piso · 3 pallet completo en altura
+    origen["prioridad"] = [(0 if alt else 1) if not pal_ else (3 if alt else 2)
+                           for pal_, alt in zip(origen["es_pallet"], origen["en_altura"])]
+    origen["nivel_num"] = pd.to_numeric(origen["nivel"], errors="coerce").fillna(1)
+
     movs = []
-    for _, d in t[t["necesidad"] > 0].sort_values("secuencia").iterrows():
+    for _, d in t[(t["necesidad"] > 0) | bajar_restos].sort_values("secuencia").iterrows():
         cand = origen[origen["Articulo"] == d["articulo"]].copy()
         if cand.empty:
             continue
-        cand["bloque"] = (cand["Fecha de caducidad"] - cand["Fecha de caducidad"].min()).dt.days // (tolerancia_dias + 1)
-        cand = cand.sort_values(["bloque", "Fecha de caducidad", "es_pallet", "Cantidad", "nivel"],
-                                ascending=[True, True, True, True, False])
+        # FEFO estricto: primero vence, primero sale. Desempate: restos en altura con menos cajas primero.
+        cand["orden_cajas"] = [c if p < 2 else 0 for c, p in zip(cand["Cantidad"], cand["prioridad"])]
+        cand["orden_nivel"] = [-n if p < 2 else n for n, p in zip(cand["nivel_num"], cand["prioridad"])]
+        cand = cand.sort_values(["Fecha de caducidad", "prioridad", "orden_cajas", "orden_nivel"])
         falta, asig, ola1, cap = d["necesidad"], 0, d["reponer_ola1"], max(d["capacidad"], 1)
+        espacio = d["espacio_libre"]
         for _, r in cand.iterrows():
             rest = r["Cantidad"]
+            resto_alt = r["prioridad"] == 0
+            if falta <= 0:
+                # necesidad cubierta: solo se sigue si el siguiente LPN en orden FEFO es un resto
+                # en altura que cabe ENTERO en el espacio libre de la posición (se baja y se elimina)
+                if not (bajar_restos and resto_alt and 0 < rest <= espacio - asig):
+                    break
+                movs.append(_mov(1, d, r, rest, 0, "Baja resto en altura (espacio libre)"))
+                asig += rest
+                continue
             while rest > 0 and falta > 0:
                 if asig < ola1:
                     ola, tope = 1, ola1 - asig
@@ -392,21 +437,36 @@ def calcular(fleet, vu, ubic, pref, zonas, paletizado=None, fecha_ref=None, tole
                     k = int((asig - ola1) // cap)
                     ola, tope = 2 + k, ola1 + (k + 1) * cap - asig
                 tomar = min(rest, falta, tope)
-                movs.append({"ola": ola, "secuencia": d["secuencia"], "pasillo_destino": d["pasillo"],
-                             "ubicacion_origen": r["Ubicacion"], "area_origen": r["Area"], "lpn": r["LPN"],
-                             "articulo": d["articulo"], "descripcion": d["descripcion"],
-                             "caducidad": r["Fecha de caducidad"], "dias_vida": int(r["dias_vida"]),
-                             "cajas_lpn": int(r["Cantidad"]), "tipo_lpn": "Pallet completo" if r["es_pallet"] else "Resto",
-                             "cajas_a_mover": int(tomar), "ubicacion_destino": d["ubicacion"],
-                             "zona_trabajo": d["zona_trabajo"], "ruta_escasez_hoy": d["ruta_escasez_hoy"]})
+                # si queda un resto en altura que cabe en la posición, se baja completo
+                if bajar_restos and ola == 1 and resto_alt and 0 < rest - tomar <= espacio - asig - tomar:
+                    tomar = rest
+                queda = rest - tomar
+                if r["es_pallet"]:
+                    efecto = ("Mueve pallet completo" if queda == 0 else
+                              "Abre pallet en altura" if r["en_altura"] else "Abre pallet en piso")
+                elif r["en_altura"]:
+                    efecto = "Elimina resto en altura" if queda == 0 else "Reduce resto en altura"
+                else:
+                    efecto = "Elimina resto en piso" if queda == 0 else "Saca de resto en piso"
+                movs.append(_mov(ola, d, r, tomar, queda, efecto))
                 rest -= tomar; falta -= tomar; asig += tomar
-            if falta <= 0:
-                break
     movs = pd.DataFrame(movs)
     if not movs.empty:
         movs = movs.sort_values(["ola", "secuencia", "caducidad"]).reset_index(drop=True)
         movs.insert(0, "n_tarea", range(1, len(movs) + 1))
         movs = movs.drop(columns="secuencia")
+
+    # control FEFO: stock en la posición de picking que vence DESPUÉS que lo más antiguo del almacenamiento
+    cad_pick = (vu[(vu["Estado de inventario"] == "D")].merge(t[["ubicacion", "articulo"]],
+                left_on=["Ubicacion", "Articulo"], right_on=["ubicacion", "articulo"]))
+    min_alm = origen.groupby("Articulo")["Fecha de caducidad"].min()
+    for _, r in cad_pick.iterrows():
+        m_ = min_alm.get(r["Articulo"])
+        if m_ is not None and pd.notna(r["Fecha de caducidad"]) and r["Fecha de caducidad"] > m_:
+            alertas.append({"tipo": "FEFO: picking tiene lote más nuevo que el almacenamiento",
+                            "ubicacion": r["Ubicacion"], "articulo": r["Articulo"],
+                            "detalle": f"Picking vence {r['Fecha de caducidad']:%d-%m-%Y} · almacenamiento "
+                                       f"tiene {m_:%d-%m-%Y} (se pickea primero lo más nuevo)"})
 
     sin_zm["motivo"] = "Sin posición ZM_CAJA (sale por pallet / trabajo dirigido u otra zona)"
     sin_map = (fleet[fleet["sku_sap"] == "SIN MAPEO"].groupby("sku_truck", as_index=False)
@@ -425,16 +485,51 @@ def calcular(fleet, vu, ubic, pref, zonas, paletizado=None, fecha_ref=None, tole
     return resumen, movs, sin_zm.reset_index(drop=True), sin_map, alertas
 
 
+def _mov(ola, d, r, tomar, queda, efecto):
+    return {"ola": ola, "secuencia": d["secuencia"], "pasillo_destino": d["pasillo"],
+            "ubicacion_origen": r["Ubicacion"], "area_origen": r["Area"], "nivel_origen": r["nivel"],
+            "lpn": r["LPN"], "articulo": d["articulo"], "descripcion": d["descripcion"],
+            "caducidad": r["Fecha de caducidad"], "dias_vida": int(r["dias_vida"]),
+            "cajas_lpn": int(r["Cantidad"]), "norma_pallet": int(r["norma"]) if pd.notna(r["norma"]) else None,
+            "tipo_lpn": "Pallet completo" if r["es_pallet"] else "Resto", "cajas_a_mover": int(tomar),
+            "queda_en_lpn": int(queda), "efecto": efecto, "ubicacion_destino": d["ubicacion"],
+            "zona_trabajo": d["zona_trabajo"], "ruta_escasez_hoy": d["ruta_escasez_hoy"],
+            "tipo_tarea": "Baja resto" if efecto.startswith("Baja resto") else "Escasez"}
+
+
+def verificar_fefo(movs, vu, fecha_ref=None):
+    """Para cada SKU: ningún LPN de ALMAC/ALMPIC (D, no vencido) que vence ANTES que el último
+    usado quedó sin tocar. Devuelve las violaciones (vacío = FEFO 100 %)."""
+    if movs is None or movs.empty:
+        return pd.DataFrame()
+    fecha_ref = pd.Timestamp(fecha_ref or pd.Timestamp.today().normalize())
+    ubic_pp = set(movs.loc[movs["area_origen"] == "ZM_PICK propia", "ubicacion_origen"])
+    o = vu[(vu["Area"].isin(AREAS_ORIGEN) | vu["Ubicacion"].isin(ubic_pp)) & (vu["Estado de inventario"] == "D") &
+           (vu["Fecha de caducidad"] > fecha_ref)]
+    usados = movs.groupby(["articulo", "lpn"])["cajas_a_mover"].sum()
+    malos = []
+    for art, g in movs.groupby("articulo"):
+        tope = g["caducidad"].max()
+        previos = o[(o["Articulo"] == art) & (o["Fecha de caducidad"] < tope)]
+        for _, r in previos.iterrows():
+            if usados.get((art, r["LPN"]), 0) < r["Cantidad"]:
+                malos.append({"articulo": art, "lpn_no_consumido": r["LPN"], "vence": r["Fecha de caducidad"],
+                              "ultimo_usado_vence": tope})
+    return pd.DataFrame(malos)
+
+
 # ================================================================== salidas
 def hoja_operarios(movs):
     if movs is None or movs.empty:
         return pd.DataFrame()
-    df = movs.sort_values(["ola", "pasillo_destino", "ubicacion_destino"])
-    return pd.DataFrame({"N°": range(1, len(df) + 1), "Ola": df["ola"].values, "Pasillo": df["pasillo_destino"].values,
+    df = movs.sort_values(["tipo_tarea", "ola", "pasillo_destino", "ubicacion_destino"], ascending=[False, True, True, True])
+    return pd.DataFrame({"N°": range(1, len(df) + 1),
+                         "Ola": [str(o) if t == "Escasez" else "R" for o, t in zip(df["ola"], df["tipo_tarea"])], "Pasillo": df["pasillo_destino"].values,
                          "SKU": df["articulo"].values, "Descripción": df["descripcion"].values,
                          "Ubicación origen": df["ubicacion_origen"].values, "LPN": df["lpn"].values,
                          "Ubicación destino": df["ubicacion_destino"].values,
-                         "Cajas": df["cajas_a_mover"].values, "Escasez desde": df["ruta_escasez_hoy"].values})
+                         "Cajas": df["cajas_a_mover"].values, "Vence": pd.to_datetime(df["caducidad"]).dt.strftime("%d-%m-%Y").values,
+                         "Efecto": df["efecto"].values, "Escasez desde": df["ruta_escasez_hoy"].values})
 
 
 def html_hoja_ruta(hoja, fecha_hora, filtros):
@@ -442,7 +537,8 @@ def html_hoja_ruta(hoja, fecha_hora, filtros):
         filas = "".join(f"""<tr><td class="c">{i}</td><td class="c">{r['Ola']}</td>
             <td class="mono b">{escape(str(r['SKU']))}</td><td>{escape(str(r['Descripción']))}</td>
             <td class="c b org">{escape(str(r['Ubicación origen']))}</td><td class="c mono">{escape(str(r['LPN']))}</td>
-            <td class="c b dst">{escape(str(r['Ubicación destino']))}</td><td class="c b qty">{int(r['Cajas'])}</td>
+            <td class="c b dst">{escape(str(r['Ubicación destino']))}</td><td class="c b qty">{int(r['Cajas'])}</td><td class="c small">{escape(str(r['Vence']))}</td>
+            <td class="small">{escape(str(r['Efecto']))}</td>
             <td class="c small">{escape(str(r['Escasez desde']))}</td><td class="chk"></td></tr>"""
                         for i, (_, r) in enumerate(df.iterrows(), start=1))
         return f"""<div class="card"><table class="hd"><tr><td class="title">Reabasto ZM_CAJA · antes de liberar</td>
@@ -450,7 +546,7 @@ def html_hoja_ruta(hoja, fecha_hora, filtros):
           <tr><td class="sub"><b>{titulo}</b> · Tareas: {len(df)} · Cajas: {int(df['Cajas'].sum())}</td>
           <td class="r small">{escape(filtros)}</td></tr></table>
           <table class="dt"><thead><tr><th>#</th><th>Ola</th><th>SKU</th><th>Descripción</th><th>Origen</th><th>LPN</th>
-          <th>Destino</th><th>Cajas</th><th>Escasez desde ruta</th><th>Check</th></tr></thead><tbody>{filas}</tbody></table>
+          <th>Destino</th><th>Cajas</th><th>Vence</th><th>Efecto</th><th>Escasez desde ruta</th><th>Check</th></tr></thead><tbody>{filas}</tbody></table>
           <table class="firmas"><tr><td>Operario: ________________</td><td>Hora inicio: ______</td>
           <td>Hora término: ______</td><td>Firma: ________________</td></tr></table></div>"""
     cuerpo = '<div class="salto"></div>'.join(bloque(g, f"Pasillo {p}") for p, g in hoja.groupby("Pasillo", sort=True))
