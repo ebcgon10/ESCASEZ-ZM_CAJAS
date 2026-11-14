@@ -61,7 +61,8 @@ if not (f_fleet and f_vu):
    - **Llenados extra:** cuántas veces más hay que llenar la posición si es más chica que la venta.
 5. **Ruta donde empieza la escasez:** recorriendo las rutas por `LOAD_PRIORITY`, la primera que deja la posición
    en cero con el stock de hoy, y la primera que lo haría aun llenando la posición al 100 %.
-6. **Quiebre CD:** ALMAC/ALMPIC no alcanza para la necesidad (pedir traslado / revisar CL).
+6. **Quiebre CD:** ALMAC, ALMPIC, MIX-01, REBA-01 y STREC no alcanzan (pedir traslado / revisar CL).
+   Reempaque, subestándar, revisión, consumo y merma no se consideran.
 
 Los SKU que no tienen posición ZM_CAJA (ZM_PICK / ZM_PALLET) quedan fuera: van por trabajo dirigido del WMS.
 """)
@@ -105,10 +106,11 @@ with st.sidebar:
                         help="A igual vencimiento se usan primero los restos de 2°/3° nivel, y si el resto cabe "
                              "entero en el espacio libre de la posición se baja completo para eliminarlo. "
                              "Nunca se salta el FEFO.")
-    usar_pp = st.checkbox("Usar también la posición ZM_PICK del mismo SKU", value=True,
+    usar_pp = st.checkbox("Usar también la posición ZM_PICK del mismo SKU", value=False,
                           help="Algunos SKU tienen posición de cajas (ZM_CAJ) y de pallet (ZM_PICK). Con esto, las "
                                "cajas para ZM_CAJ también pueden salir de su ZM_PICK, siempre respetando FEFO.")
-    st.caption("Origen ALMAC / ALMPIC · estado D · sin vencidos · **FEFO 100 %**.")
+    st.caption("Origen: ALMAC · ALMPIC · MIX-01 · REBA-01 · STREC · estado D · sin vencidos · **FEFO 100 %**. "
+               "No se usan reempaque, subestándar, revisión, consumo ni merma.")
 
 # ------------------------------------------------------------------ cálculo
 try:

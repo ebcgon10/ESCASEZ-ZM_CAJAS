@@ -29,9 +29,10 @@ Cuando cambien preferencias, capacidades o zonas en el WMS, reemplaza el CSV res
    - **Ola 1** = lo que cabe ahora (capacidad − stock) → se hace antes de liberar.
    - **Llenados extra** = reposiciones durante el picking cuando la posición es más chica que la venta.
 4. **Escasez desde ruta**: primera ruta, por `LOAD_PRIORITY`, que deja la posición en cero (con stock de hoy y con la posición llena).
-5. **Quiebre CD**: ALMAC/ALMPIC no alcanza para cubrir la necesidad.
-6. Movimientos: estado D, sin vencidos, **FEFO 100 %** (sin tolerancia). Origen ALMAC/ALMPIC y, si el SKU
-   también tiene posición ZM_PICK, esa posición.
+5. **Quiebre CD**: los orígenes válidos no alcanzan para cubrir la necesidad.
+6. Movimientos: estado D, sin vencidos, **FEFO 100 %** (sin tolerancia). Origen: **ALMAC, ALMPIC, MIX-01,
+   REBA-01 y STREC01..n**. No se usan reempaque, subestándar, revisión, consumo, merma ni retenido.
+   (Opcional: la posición ZM_PICK del mismo SKU.)
    - A igual vencimiento: **restos en 2°/3° nivel** (menos cajas primero) → restos en piso →
      pallets completos en piso → pallets completos en altura.
    - Si el resto en altura cabe entero en el espacio libre de la posición, se baja completo.

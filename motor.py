@@ -13,7 +13,8 @@ Flujo
 5. Necesidad = venta - stock picking, repartida en olas:
      ola 1   = lo que cabe ahora (capacidad - stock), se hace ANTES de liberar;
      ola 2.. = reposiciones intermedias cuando la posición es más chica que la venta.
-6. Origen: LPN en ALMAC / ALMPIC (y la posición ZM_PICK del mismo SKU, si tiene), estado D, no vencidos. FEFO 100 % (sin tolerancia).
+6. Origen: ALMAC, ALMPIC, MIX-01, REBA-01 y STREC (opcional: la ZM_PICK del mismo SKU), estado D, no vencidos.
+   Se excluyen reempaque, subestándar, revisión, consumo, merma, retenido y transferencias. FEFO 100 % (sin tolerancia).
    A igual vencimiento: restos en 2°/3° nivel primero (menos cajas primero), luego restos en piso,
    luego pallets completos en piso y al final pallets completos en altura.
    Si un resto en altura cabe entero en el espacio libre de la posición, se baja completo.
@@ -30,7 +31,15 @@ from html import escape
 
 import pandas as pd
 
-AREAS_ORIGEN = ["ALMAC", "ALMPIC"]
+AREAS_ORIGEN = ["ALMAC", "ALMPIC"]                    # almacenamiento y almacenamiento picking
+UBIC_ORIGEN_EXTRA = r"^(MIX-01|REBA-01|STREC\d*)$"    # ubicaciones de patio válidas como origen
+# NO se consideran: reempaque (REEM), subestándar (SUBEST), revisión/consumo (REV), merma (COBR),
+# retenido (RETE), transferencias (RDTS...), retorno flete y el resto del patio.
+
+
+def es_origen(vu):
+    """True para stock que sirve para abastecer: ALMAC, ALMPIC, MIX-01, REBA-01 y STREC01..n."""
+    return vu["Area"].isin(AREAS_ORIGEN) | vu["Ubicacion"].str.upper().str.match(UBIC_ORIGEN_EXTRA, na=False)
 URL_BBDD = "https://raw.githubusercontent.com/ebcgon10/sistema-revision-venta/main/bbdd_codigos.csv"
 
 # columnas del fleetloader Truck (FLETBxxxx.TXT)
@@ -279,7 +288,7 @@ ESTADOS = {"Quiebre CD (no alcanza almacenamiento)": "#F4CCCC",
 
 
 def calcular(fleet, vu, ubic, pref, zonas, paletizado=None, fecha_ref=None, holgura_pct=0.0,
-             bajar_restos=True, usar_zm_pick=True):
+             bajar_restos=True, usar_zm_pick=False):
     fecha_ref = pd.Timestamp(fecha_ref or pd.Timestamp.today().normalize())
     alertas = []
 
@@ -313,8 +322,8 @@ def calcular(fleet, vu, ubic, pref, zonas, paletizado=None, fecha_ref=None, holg
     pick_pal = pick_pal.merge(pref[["ubicacion", "articulo"]], on="ubicacion")
     llave_pp = set(zip(pick_pal["ubicacion"], pick_pal["articulo"]))
     es_pp = pd.Series([(u, a) in llave_pp for u, a in zip(disp["Ubicacion"], disp["Articulo"])], index=disp.index)
-    origen = disp[disp["Area"].isin(AREAS_ORIGEN) | (es_pp & usar_zm_pick)].copy()
-    origen.loc[~origen["Area"].isin(AREAS_ORIGEN), "Area"] = "ZM_PICK propia"
+    origen = disp[es_origen(disp) | (es_pp & usar_zm_pick)].copy()
+    origen.loc[~es_origen(origen), "Area"] = "ZM_PICK propia"
     st_pp = disp[es_pp].groupby("Articulo")["Cantidad"].sum()
     vencidos = origen[origen["dias_vida"] <= 0]
     origen = origen[(origen["dias_vida"] > 0) & origen["Fecha de caducidad"].notna()]
@@ -334,13 +343,6 @@ def calcular(fleet, vu, ubic, pref, zonas, paletizado=None, fecha_ref=None, holg
                         "ubicacion": r["ubicacion"], "articulo": r["articulo"],
                         "detalle": f"Maestro {int(r['capacidad'])} cj · stock {int(r['stock_picking'])} cj → revisar vía ADC"})
     t["capacidad"] = t[["capacidad", "stock_picking"]].max(axis=1)
-
-    # stock del SKU en otras áreas (patio, reempaque, etc.) para saber dónde buscar si no alcanza
-    otras = vu[~vu["Area"].isin(AREAS_ORIGEN) & ~vu["Ubicacion"].isin(pos["ubicacion"])
-               & ~vu["Ubicacion"].isin(pick_pal["ubicacion"])]
-    otras = (otras.groupby(["Articulo", "Area", "Estado de inventario"])["Cantidad"].sum().reset_index())
-    otras["txt"] = otras["Area"] + "/" + otras["Estado de inventario"] + ": " + otras["Cantidad"].astype(int).astype(str)
-    t["stock_otras_areas"] = t["articulo"].map(otras.groupby("Articulo")["txt"].agg(" · ".join)).fillna("")
 
     t["venta_objetivo"] = (t["venta_cajas"] * (1 + holgura_pct / 100)).apply(math.ceil)
     t["necesidad"] = (t["venta_objetivo"] - t["stock_picking"]).clip(lower=0)
@@ -385,7 +387,7 @@ def calcular(fleet, vu, ubic, pref, zonas, paletizado=None, fecha_ref=None, holg
 
     resumen = t[["secuencia", "pasillo", "ubicacion", "zona_trabajo", "articulo", "descripcion", "rutas",
                  "venta_cajas", "capacidad", "stock_picking", "necesidad", "reponer_ola1", "reponer_intermedio",
-                 "llenados_extra", "stock_almacenamiento", "stock_zm_pick", "faltante_cd", "stock_otras_areas", "ruta_escasez_hoy",
+                 "llenados_extra", "stock_almacenamiento", "stock_zm_pick", "faltante_cd", "ruta_escasez_hoy",
                  "ruta_escasez_lleno", "estado"]].rename(columns={"ubicacion": "ubicacion_zm_caja",
                                                                   "articulo": "sku_sap"})
     orden = {e: i for i, e in enumerate(ESTADOS)}
@@ -479,7 +481,7 @@ def calcular(fleet, vu, ubic, pref, zonas, paletizado=None, fecha_ref=None, holg
                         "articulo": r["Articulo"], "detalle": f"LPN {r['LPN']} ({int(r['Cantidad'])} cj)"})
     sin_alm = t[(t["necesidad"] > 0) & (t["stock_almacenamiento"] == 0) & t["articulo"].isin(vu["Articulo"])]
     for _, r in sin_alm.iterrows():
-        alertas.append({"tipo": "Sin stock en ALMAC/ALMPIC (revisar otras áreas / CL)", "ubicacion": r["ubicacion"],
+        alertas.append({"tipo": "Sin stock en almacenamiento ni MIX/REBA/STREC (pedir traslado / CL)", "ubicacion": r["ubicacion"],
                         "articulo": r["articulo"], "detalle": f"Necesidad {int(r['necesidad'])} cj"})
     alertas = pd.DataFrame(alertas, columns=["tipo", "ubicacion", "articulo", "detalle"])
     return resumen, movs, sin_zm.reset_index(drop=True), sin_map, alertas
@@ -498,13 +500,13 @@ def _mov(ola, d, r, tomar, queda, efecto):
 
 
 def verificar_fefo(movs, vu, fecha_ref=None):
-    """Para cada SKU: ningún LPN de ALMAC/ALMPIC (D, no vencido) que vence ANTES que el último
+    """Para cada SKU: ningún LPN de origen válido (D, no vencido) que vence ANTES que el último
     usado quedó sin tocar. Devuelve las violaciones (vacío = FEFO 100 %)."""
     if movs is None or movs.empty:
         return pd.DataFrame()
     fecha_ref = pd.Timestamp(fecha_ref or pd.Timestamp.today().normalize())
     ubic_pp = set(movs.loc[movs["area_origen"] == "ZM_PICK propia", "ubicacion_origen"])
-    o = vu[(vu["Area"].isin(AREAS_ORIGEN) | vu["Ubicacion"].isin(ubic_pp)) & (vu["Estado de inventario"] == "D") &
+    o = vu[(es_origen(vu) | vu["Ubicacion"].isin(ubic_pp)) & (vu["Estado de inventario"] == "D") &
            (vu["Fecha de caducidad"] > fecha_ref)]
     usados = movs.groupby(["articulo", "lpn"])["cajas_a_mover"].sum()
     malos = []
