@@ -29,13 +29,8 @@ Se puede subir más de un fleetloader si la venta del día viene en varias sesio
 - `zonas.csv`: zona de trabajo / movimiento (`ZM_CAJ`, `ZM_PICK`, …).
 - `paletizado.csv`: cajas por pallet (si falta, se usa la norma del Truck: `QTY_PER_LAYER × LAYERS_PER_PALLET`).
 
-Maestros cargados desde *Datos_para_armar.xlsx* (14-11-2026). Para actualizarlos:
-- **En la app:** barra lateral → *Maestros WMS (opcional)* → sube el Excel con hojas UBICACIONES / PREFERENCIA / ZM
-  (reemplaza los del repo solo en esa sesión).
-- **En el repo:** reemplaza `ubicaciones.csv`, `preferencia.csv` y `zonas.csv` (mismas columnas).
-
-La pestaña **ADC maestro WMS** arma el control de cambios sugerido (capacidades menores al stock, posiciones con
-otro artículo, ubicaciones con 2 artículos) para validarlo antes de cargarlo en el WMS.
+Maestros cargados desde *Datos_para_armar.xlsx* (14-11-2026). Para actualizarlos, reemplaza
+`ubicaciones.csv`, `preferencia.csv` y `zonas.csv` en `maestros/` (mismas columnas).
 
 ## Cálculo
 1. SKU TRUCK → SAP (se ignoran los ceros a la izquierda: `00450604` = `450604`). Se suma el mismo SKU repetido en varias bahías.
