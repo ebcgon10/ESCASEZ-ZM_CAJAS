@@ -25,6 +25,21 @@ div[data-testid="stFileUploader"] {{ background: #fff; border-radius: 14px; padd
 div.stButton > button {{ background-color: {VERDE}; color: #fff; font-weight: 700; font-size: 1.1rem;
     border: none; border-radius: 8px; padding: .75rem 0; width: 100%; }}
 div.stButton > button:hover {{ background-color: #4E9A28; color: #fff; }}
+header[data-testid="stHeader"] {{ background: #DCEBD9; }}
+header[data-testid="stHeader"] * {{ color: {VERDE_OSC} !important; }}
+div[data-testid="stFileUploader"] label p {{ color: {VERDE_OSC} !important; font-weight: 600; }}
+section[data-testid="stFileUploaderDropzone"] {{ background: #F2F8F0 !important; border: 2px dashed {VERDE} !important;
+    color: {VERDE_OSC} !important; }}
+section[data-testid="stFileUploaderDropzone"] * {{ color: {VERDE_OSC} !important; }}
+div[data-testid="stFileUploaderFile"], div[data-testid="stFileUploaderFile"] * {{ color: {VERDE_OSC} !important; }}
+div[data-testid="stFileUploader"] button {{ background: #fff !important; color: {VERDE_OSC} !important;
+    border: 1px solid {VERDE} !important; }}
+div[data-testid="stAlert"] {{ background: #FFFFFF !important; border-left: 6px solid {VERDE} !important;
+    border-radius: 10px; }}
+div[data-testid="stAlert"] * {{ color: {VERDE_OSC} !important; font-weight: 600; }}
+div[data-testid="stDownloadButton"] button {{ background: #fff !important; color: {VERDE_OSC} !important;
+    border: 2px solid {VERDE} !important; font-weight: 700; }}
+hr {{ border-color: #B9D3B2 !important; }}
 </style>""", unsafe_allow_html=True)
 
 st.markdown('<div class="titulo">Escasez ZM_CAJAS · Reposición antes de liberar</div>', unsafe_allow_html=True)
@@ -51,7 +66,7 @@ with c2:
     f_vu = st.file_uploader("Archivo de inventario", type=["csv"], key="vu")
 
 st.divider()
-if st.button("🚀 Procesar Reposición ZM_CAJAS"):
+if st.button("🚀 Procesar Reposición ZM_CAJAS", use_container_width=True):
     if not (f_fleet and f_vu):
         st.error("Sube los 2 archivos: fleetloader y operaciones de vida útil.")
     else:
