@@ -31,6 +31,12 @@ def maestros():
 
 
 @st.cache_data
+def maestros_excel(datos: bytes, nombre: str):
+    import io
+    return motor.cargar_maestros(*motor.hojas_maestro_excel(io.BytesIO(datos)))
+
+
+@st.cache_data
 def paletizado():
     return motor.cargar_paletizado(os.path.join(M, "paletizado.csv"))
 
@@ -47,6 +53,9 @@ with st.sidebar:
                                accept_multiple_files=True,
                                help="Puedes subir más de uno si la venta del día viene en varias sesiones.")
     f_vu = st.file_uploader("Operaciones de vida útil (.csv)", type=["csv"])
+    with st.expander("Maestros WMS (opcional)"):
+        f_maestro = st.file_uploader("Excel con hojas UBICACIONES / PREFERENCIA / ZM", type=["xlsx"],
+                                     help="Si lo subes, reemplaza por esta sesión los maestros guardados en el repo.")
 
 if not (f_fleet and f_vu):
     st.info("⬅️ Sube el **fleetloader** y las **operaciones de vida útil**.")
@@ -85,7 +94,12 @@ if not all(cols.get(k) for k in ["camion", "codigo", "cantidad"]):
     cols["codigo"] = b.selectbox("SKU TRUCK", c)
     cols["cantidad"] = d.selectbox("Cantidad (cajas)", c)
 
-ub, pr, zm = maestros()
+try:
+    ub, pr, zm = maestros_excel(f_maestro.getvalue(), f_maestro.name) if f_maestro else maestros()
+    origen_maestros = f_maestro.name if f_maestro else "repo (maestros/)"
+except Exception as e:
+    st.error(f"No se pudo leer el Excel de maestros: {e}")
+    st.stop()
 pal = paletizado()
 bb, origen_bbdd = bbdd()
 todas = motor.preparar_fleet(raw, cols, bb, pal)
@@ -122,6 +136,7 @@ try:
         usar_zm_pick=usar_pp)
     fefo_mal = motor.verificar_fefo(movs, vu, fecha_ref)
     dinamica = motor.tabla_dinamica(fleet)
+    adc = motor.propuesta_adc(alertas, ub, pr)
 except Exception as e:
     st.error(f"No se pudo procesar: {e}")
     st.stop()
@@ -147,7 +162,7 @@ if not movs.empty:
               help="Solo ocurre cuando FEFO obliga (el lote más antiguo es un pallet completo en altura).")
     if not fefo_mal.empty:
         st.error("Hay LPN más antiguos sin consumir: revisar pestaña Alertas / reporte.")
-st.caption(f"Sesión Truck: {fecha_sesion} · BBDD códigos: {origen_bbdd} · Fecha de referencia {fecha_ref:%d-%m-%Y}")
+st.caption(f"Sesión Truck: {fecha_sesion} · BBDD códigos: {origen_bbdd} · Maestros: {origen_maestros} · Fecha de referencia {fecha_ref:%d-%m-%Y}")
 if len(sin_map):
     st.warning(f"⚠️ {len(sin_map)} SKU TRUCK sin mapeo a SAP ({n(sin_map['cajas'].sum())} cj). "
                "Agrégalos a bbdd_codigos.csv (pestaña *Sin mapeo / sin ZM_CAJA*).")
@@ -157,8 +172,9 @@ def pintar(row):
     return [f"background-color: {motor.ESTADOS.get(row['estado'], 'white')}; color: #111"] * len(row)
 
 
-t1, t2, t3, t4, t5, t6 = st.tabs(["📋 Resumen por SKU", "🖨️ Hoja operarios", "🔁 Movimientos",
-                                  "📊 Tabla dinámica / rutas", "❓ Sin mapeo / sin ZM_CAJA", "⚠️ Alertas"])
+t1, t2, t3, t4, t5, t6, t7 = st.tabs(["📋 Resumen por SKU", "🖨️ Hoja operarios", "🔁 Movimientos",
+                                      "📊 Tabla dinámica / rutas", "❓ Sin mapeo / sin ZM_CAJA", "⚠️ Alertas",
+                                      "📝 ADC maestro WMS"])
 with t1:
     est = st.multiselect("Estado", list(motor.ESTADOS), default=list(motor.ESTADOS)[:3])
     vista = resumen[resumen["estado"].isin(est)] if est else resumen
@@ -217,10 +233,14 @@ with t5:
     st.dataframe(sin_zm, use_container_width=True, hide_index=True)
 with t6:
     st.dataframe(alertas, use_container_width=True, height=500, hide_index=True)
+with t7:
+    st.caption("Control de cambios sugerido para el maestro WMS (capacidades, preferencias). "
+               "Cada línea se valida antes de cargarla en el WMS.")
+    st.dataframe(adc, use_container_width=True, height=500, hide_index=True)
 
 st.divider()
 params = {"Fecha de referencia": fecha_ref.strftime("%d-%m-%Y"), "Sesión Truck": fecha_sesion,
-          "Fleetloader": ", ".join(f.name for f in f_fleet), "Vida útil": f_vu.name, "BBDD códigos": origen_bbdd,
+          "Fleetloader": ", ".join(f.name for f in f_fleet), "Vida útil": f_vu.name, "BBDD códigos": origen_bbdd, "Maestros WMS": origen_maestros,
           "Rutas excluidas": ", ".join(excluir) or "Ninguna",
           "Descontar pallets completos": "Sí" if descontar else "No", "Holgura (%)": holgura,
           "FEFO": "100 % (sin tolerancia)", "Bajar restos en altura": "Sí" if bajar else "No",
@@ -229,6 +249,7 @@ st.download_button("📊 Reporte completo (Excel)", type="primary", use_containe
                    data=motor.a_excel({"Resumen SKU": resumen, "Movimientos": movs, "Venta por SKU": dinamica,
                                        "Venta ZM_CAJA por ruta": motor.matriz_camiones(fleet, solo=resumen["sku_sap"]),
                                        "Detalle fleetloader": fleet, "Sin mapeo": sin_map, "Sin ZM_CAJA": sin_zm,
-                                       "Alertas": alertas, "Control FEFO": fefo_mal}, params),
+                                       "Alertas": alertas, "Control FEFO": fefo_mal,
+                                       "ADC maestro WMS": adc}, params),
                    file_name=f"escasez_zm_caja_{fecha_ref:%Y%m%d}.xlsx",
                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")

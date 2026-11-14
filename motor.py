@@ -117,23 +117,49 @@ def pasillo_de(ubic):
 
 
 # ================================================================== maestros WMS
+def _df(x, sep=","):
+    return _norm_cols(x.astype(str)) if isinstance(x, pd.DataFrame) else _leer_csv(x, sep=sep)
+
+
 def cargar_maestros(ruta_ubic, ruta_pref, ruta_zonas):
-    ubic = _leer_csv(ruta_ubic, sep=",").rename(columns={
+    """Acepta rutas CSV o DataFrames (p.ej. hojas del Excel 'Datos para armar')."""
+    ubic = _df(ruta_ubic).rename(columns={
         "NOMBRE UBICACIÓN": "ubicacion", "AREA": "area_maestro", "CAPACIDAD MAXIMA": "capacidad_txt"})
     ubic["ubicacion"] = _txt(ubic["ubicacion"])
     ubic["capacidad"] = ubic["capacidad_txt"].astype(str).str.extract(r"(\d+)")[0].astype(float)
-    pref = _leer_csv(ruta_pref, sep=",").rename(columns={
+    ubic["unidad_cap"] = ubic["capacidad_txt"].astype(str).str.extract(r"\d+\s*(\S+)")[0]
+    pref = _df(ruta_pref).rename(columns={
         "Ubicación": "ubicacion", "Número de artículo": "articulo", "Secuencia": "secuencia"})
     pref["ubicacion"] = _txt(pref["ubicacion"])
     pref["articulo"] = _txt(pref["articulo"])
-    pref["secuencia"] = pd.to_numeric(pref["secuencia"], errors="coerce")
-    zonas = _leer_csv(ruta_zonas, sep=",").rename(columns={
+    pref = pref[(pref["ubicacion"] != "") & (pref["articulo"] != "")].drop_duplicates(["ubicacion", "articulo"])
+    if "secuencia" in pref.columns:
+        pref["secuencia"] = pd.to_numeric(pref["secuencia"], errors="coerce")
+    else:
+        pref["secuencia"] = float("nan")
+    # sin secuencia de ruta en el maestro: se ordena por ubicación (pasillo-columna-nivel-posición)
+    orden_ubic = pref["ubicacion"].rank(method="dense")
+    pref["secuencia"] = pref["secuencia"].fillna(orden_ubic + 100000)
+    zonas = _df(ruta_zonas).rename(columns={
         "UBICACIÓN": "ubicacion", "ZONA DE TRABAJO": "zona_trabajo",
         "ZONA DE MOVIMIENTO": "zona_movimiento", "ZONA DE RECOGIDA": "zona_recogida"})
     for c in zonas.columns:
         zonas[c] = _txt(zonas[c])
     zonas["zona_movimiento"] = zonas["zona_movimiento"].str.upper()
     return ubic, pref, zonas
+
+
+def hojas_maestro_excel(archivo):
+    """Del Excel 'Datos para armar' toma las hojas de UBICACIONES, PREFERENCIA y ZM (por nombre parecido)."""
+    if hasattr(archivo, "seek"):
+        archivo.seek(0)
+    hojas = pd.read_excel(archivo, sheet_name=None, dtype=str)
+    buscar = lambda clave: next((df for n, df in hojas.items() if clave in _sin_tildes(n)), None)  # noqa: E731
+    u, p, z = buscar("ubicacion"), buscar("preferencia"), buscar("zm") if buscar("zm") is not None else buscar("zona")
+    faltan = [n for n, d in [("UBICACIONES", u), ("PREFERENCIA", p), ("ZM", z)] if d is None]
+    if faltan:
+        raise ValueError(f"Al Excel de maestros le faltan las hojas: {', '.join(faltan)}")
+    return u, p, z
 
 
 def cargar_paletizado(archivo):
@@ -295,7 +321,15 @@ def calcular(fleet, vu, ubic, pref, zonas, paletizado=None, fecha_ref=None, holg
     # posiciones ZM_CAJ con artículo asignado (1 por artículo)
     pos = zonas[zonas["zona_movimiento"] == "ZM_CAJ"][["ubicacion", "zona_trabajo"]].drop_duplicates("ubicacion")
     pos = pos.merge(pref[["ubicacion", "articulo", "secuencia"]], on="ubicacion")
-    pos = pos[pos["articulo"] != ""].merge(ubic[["ubicacion", "capacidad"]], on="ubicacion", how="left")
+    pos = pos[pos["articulo"] != ""].merge(ubic[["ubicacion", "capacidad", "unidad_cap"]], on="ubicacion", how="left")
+    for u_, g_ in pos.groupby("ubicacion"):
+        if len(g_) > 1:
+            alertas.append({"tipo": "Ubicación ZM_CAJA con 2+ artículos en preferencia (capacidad compartida)",
+                            "ubicacion": u_, "articulo": ", ".join(g_["articulo"]),
+                            "detalle": "Se calcula cada artículo con la capacidad completa → revisar vía ADC"})
+    for _, r in pos[pos["unidad_cap"].fillna("").str.lower().str.startswith("pal")].iterrows():
+        alertas.append({"tipo": "Posición ZM_CAJA con capacidad en Palés (se lee como cajas)", "ubicacion": r["ubicacion"],
+                        "articulo": r["articulo"], "detalle": f"Capacidad {int(r['capacidad'])} Palés → revisar vía ADC"})
     pos["capacidad"] = pos["capacidad"].fillna(0)
     pos = pos.sort_values("secuencia").drop_duplicates("articulo")
 
@@ -518,6 +552,41 @@ def verificar_fefo(movs, vu, fecha_ref=None):
                 malos.append({"articulo": art, "lpn_no_consumido": r["LPN"], "vence": r["Fecha de caducidad"],
                               "ultimo_usado_vence": tope})
     return pd.DataFrame(malos)
+
+
+def propuesta_adc(alertas, ubic, pref):
+    """Control de cambios (ADC) sugerido para el maestro WMS a partir de las alertas.
+    Son propuestas: el key user valida cada línea antes de cargarla en el WMS."""
+    cap = ubic.set_index("ubicacion")["capacidad_txt"]
+    filas = []
+    for _, r in alertas.iterrows():
+        t, u = r["tipo"], r["ubicacion"]
+        if t.startswith("Capacidad del maestro menor"):
+            stock = re.search(r"stock (\d+)", r["detalle"]).group(1)
+            filas.append(("Capacidad máxima", u, r["articulo"], cap.get(u, ""), f"≥ {stock} Piezas",
+                          "Stock físico supera la capacidad configurada"))
+        elif t.startswith("Capacidad ZM_CAJA chica"):
+            filas.append(("Capacidad máxima / reubicación", u, r["articulo"], cap.get(u, ""),
+                          "Aumentar capacidad o asignar posición más grande", r["detalle"]))
+        elif t.startswith("Posición ZM_CAJA sin capacidad"):
+            filas.append(("Capacidad máxima", u, r["articulo"], cap.get(u, ""), "Definir capacidad en Piezas",
+                          "Capacidad 0 o vacía"))
+        elif "capacidad en Palés" in t:
+            filas.append(("Unidad de capacidad", u, r["articulo"], cap.get(u, ""), "Cambiar unidad a Piezas",
+                          "Posición de cajas configurada en Palés"))
+        elif t.startswith("Posición ZM_CAJA con otro artículo"):
+            filas.append(("Preferencia / stock", u, r["articulo"], f"Preferencia {r['articulo']}",
+                          "Reubicar el stock encontrado o actualizar la preferencia", r["detalle"]))
+        elif t.startswith("Ubicación ZM_CAJA con 2+"):
+            filas.append(("Preferencia", u, r["articulo"], "2 artículos en la misma ubicación",
+                          "Dejar 1 artículo por posición ZM_CAJA", r["detalle"]))
+    adc = pd.DataFrame(filas, columns=["tipo_cambio", "ubicacion", "articulo", "valor_actual", "valor_propuesto",
+                                       "motivo"]).drop_duplicates(["tipo_cambio", "ubicacion", "articulo"])
+    adc.insert(0, "n_adc", range(1, len(adc) + 1))
+    for c in ["aprobado_por", "fecha_carga_wms", "estado"]:
+        adc[c] = ""
+    adc["estado"] = "Pendiente"
+    return adc
 
 
 # ================================================================== salidas
